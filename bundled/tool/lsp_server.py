@@ -11,7 +11,7 @@ import re
 import sys
 import sysconfig
 import traceback
-from typing import Any, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 
 # **********************************************************
@@ -32,14 +32,15 @@ update_sys_path(
     os.getenv("LS_IMPORT_STRATEGY", "useBundled"),
 )
 
+import lsprotocol.types as lsp
+from pygls import server, uris, workspace
+
 # **********************************************************
 # Imports needed for the language server goes below this.
 # **********************************************************
 # pylint: disable=wrong-import-position,import-error
 import lsp_jsonrpc as jsonrpc
 import lsp_utils as utils
-import lsprotocol.types as lsp
-from pygls import server, uris, workspace
 
 WORKSPACE_SETTINGS = {}
 GLOBAL_SETTINGS = {}
@@ -48,7 +49,7 @@ RUNNER = pathlib.Path(__file__).parent / "lsp_runner.py"
 MAX_WORKERS = 5
 # TODO: Update the language server name and version.
 LSP_SERVER = server.LanguageServer(
-    name="<pytool-display-name>", version="<server version>", max_workers=MAX_WORKERS
+    name="Prospector", version="0.0.1", max_workers=MAX_WORKERS
 )
 
 
@@ -67,15 +68,18 @@ LSP_SERVER = server.LanguageServer(
 
 # TODO: Update TOOL_MODULE with the module name for your tool.
 # e.g, TOOL_MODULE = "pylint"
-TOOL_MODULE = "<pytool-module>"
+TOOL_MODULE = "prospector"
 
 # TODO: Update TOOL_DISPLAY with a display name for your tool.
 # e.g, TOOL_DISPLAY = "Pylint"
-TOOL_DISPLAY = "<pytool-display-name>"
+TOOL_DISPLAY = "Prospector"
 
 # TODO: Update TOOL_ARGS with default argument you have to pass to your tool in
 # all scenarios.
-TOOL_ARGS = []  # default arguments always passed to your tool.
+TOOL_ARGS = [
+    "--output=pylint",
+    "--die-on-tool-error",
+]  # default arguments always passed to your tool.
 
 
 # TODO: If your tool is a linter then update this section.
@@ -86,6 +90,68 @@ TOOL_ARGS = []  # default arguments always passed to your tool.
 
 #  See `pylint` implementation for a full featured linter extension:
 #  Pylint: https://github.com/microsoft/vscode-pylint/blob/main/bundled/tool
+
+
+DOCUMENTATION_HOME = "https://pylint.readthedocs.io/en/latest/user_guide/messages"
+
+
+def _build_message_doc_url(code: str) -> str:
+    """Build the URL to the documentation for this diagnostic message."""
+    msg_id, message = code.split(":")
+    category = utils.get_message_category(msg_id)
+    uri = f"{category}/{message}.html" if category else DOCUMENTATION_HOME
+    return f"{DOCUMENTATION_HOME}/{uri}"
+
+
+def _parse_output(
+    content: str,
+    severity: Dict[str, str],
+) -> Sequence[lsp.Diagnostic]:
+    """Parses linter messages and return LSP diagnostic object for each message."""
+    diagnostics = []
+    line_offset = 1
+
+    messages: List[Dict[str, Any]] = json.loads(content)
+    for data in messages:
+        start = lsp.Position(
+            line=int(data.get("line")) - line_offset,
+            character=int(data.get("column")),
+        )
+
+        if data.get("endLine") is not None:
+            end = lsp.Position(
+                line=int(data.get("endLine")) - line_offset,
+                character=int(data.get("endColumn", 0)),
+            )
+        else:
+            # If there is no endLine we can use `start` for end position.
+            # According to LSP range will include the character at `start`
+            # but will exclude character at `end`. The LSP client in this
+            # case can decide the actual range based on th token this
+            # points to.
+            end = start
+
+        code = f"{data.get('message-id')}:{data.get('symbol')}"
+        documentation_url = _build_message_doc_url(code)
+
+        diagnostic = lsp.Diagnostic(
+            range=lsp.Range(start=start, end=end),
+            message=data.get("message"),
+            severity=_get_severity(
+                data.get("symbol"), data.get("message-id"), data.get("type"), severity
+            ),
+            code=f"{data.get('message-id')}:{data.get('symbol')}",
+            code_description=lsp.CodeDescription(href=documentation_url),
+            source=TOOL_DISPLAY,
+        )
+
+        diagnostics.append(diagnostic)
+
+    return diagnostics
+
+
+# Captures version of `pylint` in various workspaces.
+VERSION_TABLE: Dict[str, (int, int, int)] = {}
 
 
 @LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
@@ -113,12 +179,28 @@ def did_close(params: lsp.DidCloseTextDocumentParams) -> None:
 
 
 def _linting_helper(document: workspace.Document) -> list[lsp.Diagnostic]:
-    # TODO: Determine if your tool supports passing file content via stdin.
-    # If you want to support linting on change then your tool will need to
-    # support linting over stdin to be effective. Read, and update
-    # _run_tool_on_document and _run_tool functions as needed for your project.
-    result = _run_tool_on_document(document)
-    return _parse_output_using_regex(result.stdout) if result.stdout else []
+    try:
+        extra_args = []
+
+        code_workspace = _get_settings_by_document(document)["workspaceFS"]
+        if VERSION_TABLE.get(code_workspace, None):
+            major, minor, _ = VERSION_TABLE[code_workspace]
+            if major == 2 and minor >= 16:
+                extra_args += ["--clear-cache-post-run=y"]
+
+        result = _run_tool_on_document(document, use_stdin=True, extra_args=extra_args)
+        if result and result.stdout:
+            log_to_output(f"{document.uri} :\r\n{result.stdout}")
+
+            # deep copy here to prevent accidentally updating global settings.
+            settings = copy.deepcopy(_get_settings_by_document(document))
+            return _parse_output(result.stdout, severity=settings["severity"])
+    except Exception:  # pylint: disable=broad-except
+        LSP_SERVER.show_message_log(
+            f"Linting failed with error:\r\n{traceback.format_exc()}",
+            lsp.MessageType.Error,
+        )
+    return []
 
 
 # TODO: If your linter outputs in a known format like JSON, then parse
@@ -173,84 +255,24 @@ def _parse_output_using_regex(content: str) -> list[lsp.Diagnostic]:
 # for `pylint` extension from our team.
 # Pylint: https://github.com/microsoft/vscode-pylint
 # Follow the flow of severity from the settings in package.json to the server.
-def _get_severity(*_codes: list[str]) -> lsp.DiagnosticSeverity:
-    # TODO: All reported issues from linter are treated as warning.
-    # change it as appropriate for your linter.
-    return lsp.DiagnosticSeverity.Warning
+def _get_severity(
+    symbol: str, code: str, code_type: str, severity: Dict[str, str]
+) -> lsp.DiagnosticSeverity:
+    value = (
+        severity.get(symbol, None)
+        or severity.get(code, None)
+        or severity.get(code_type, "Error")
+    )
+    try:
+        return lsp.DiagnosticSeverity[value]
+    except KeyError:
+        pass
+
+    return lsp.DiagnosticSeverity.Error
 
 
 # **********************************************************
 # Linting features end here
-# **********************************************************
-
-# TODO: If your tool is a formatter then update this section.
-# Delete "Formatting features" section if your tool is NOT a
-# formatter.
-# **********************************************************
-# Formatting features start here
-# **********************************************************
-#  Sample implementations:
-#  Black: https://github.com/microsoft/vscode-black-formatter/blob/main/bundled/tool
-
-
-@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_FORMATTING)
-def formatting(params: lsp.DocumentFormattingParams) -> list[lsp.TextEdit] | None:
-    """LSP handler for textDocument/formatting request."""
-    # If your tool is a formatter you can use this handler to provide
-    # formatting support on save. You have to return an array of lsp.TextEdit
-    # objects, to provide your formatted results.
-
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
-    edits = _formatting_helper(document)
-    if edits:
-        return edits
-
-    # NOTE: If you provide [] array, VS Code will clear the file of all contents.
-    # To indicate no changes to file return None.
-    return None
-
-
-def _formatting_helper(document: workspace.Document) -> list[lsp.TextEdit] | None:
-    # TODO: For formatting on save support the formatter you use must support
-    # formatting via stdin.
-    # Read, and update_run_tool_on_document and _run_tool functions as needed
-    # for your formatter.
-    result = _run_tool_on_document(document, use_stdin=True)
-    if result.stdout:
-        new_source = _match_line_endings(document, result.stdout)
-        return [
-            lsp.TextEdit(
-                range=lsp.Range(
-                    start=lsp.Position(line=0, character=0),
-                    end=lsp.Position(line=len(document.lines), character=0),
-                ),
-                new_text=new_source,
-            )
-        ]
-    return None
-
-
-def _get_line_endings(lines: list[str]) -> str:
-    """Returns line endings used in the text."""
-    try:
-        if lines[0][-2:] == "\r\n":
-            return "\r\n"
-        return "\n"
-    except Exception:  # pylint: disable=broad-except
-        return None
-
-
-def _match_line_endings(document: workspace.Document, text: str) -> str:
-    """Ensures that the edited text line endings matches the document line endings."""
-    expected = _get_line_endings(document.source.splitlines(keepends=True))
-    actual = _get_line_endings(text.splitlines(keepends=True))
-    if actual == expected or actual is None or expected is None:
-        return text
-    return text.replace(actual, expected)
-
-
-# **********************************************************
-# Formatting features ends here
 # **********************************************************
 
 
@@ -376,10 +398,10 @@ def _run_tool_on_document(
     if use_stdin is true then contents of the document is passed to the
     tool via stdin.
     """
-    if str(document.uri).startswith("vscode-notebook-cell"):
-        # TODO: Decide on if you want to skip notebook cells.
-        # Skip notebook cells
-        return None
+    # if str(document.uri).startswith("vscode-notebook-cell"):
+    # TODO: Decide on if you want to skip notebook cells.
+    # Skip notebook cells
+    # return None
 
     if utils.is_stdlib_file(document.path):
         # TODO: Decide on if you want to skip standard library files.
@@ -467,7 +489,7 @@ def _run_tool_on_document(
         # sys.path and that might not work for this scenario next time around.
         with utils.substitute_attr(sys, "path", sys.path[:]):
             try:
-                # TODO: `utils.run_module` is equivalent to running `python -m <pytool-module>`.
+                # TODO: `utils.run_module` is equivalent to running `python -m prospector`.
                 # If your tool supports a programmatic API then replace the function below
                 # with code for your tool. You can also use `utils.run_api` helper, which
                 # handles changing working directories, managing io streams, etc.
@@ -550,7 +572,7 @@ def _run_tool(extra_args: Sequence[str]) -> utils.RunResult:
         # sys.path and that might not work for this scenario next time around.
         with utils.substitute_attr(sys, "path", sys.path[:]):
             try:
-                # TODO: `utils.run_module` is equivalent to running `python -m <pytool-module>`.
+                # TODO: `utils.run_module` is equivalent to running `python -m prospector`.
                 # If your tool supports a programmatic API then replace the function below
                 # with code for your tool. You can also use `utils.run_api` helper, which
                 # handles changing working directories, managing io streams, etc.
